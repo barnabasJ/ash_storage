@@ -4,20 +4,27 @@ defmodule AshStorage.Changes.Attach do
 
   require Ash.Query
 
+  alias AshStorage.Error.UploadCleanupFailed
   alias AshStorage.Info
   alias AshStorage.Service.Context
 
-  @impl true
+  @impl Ash.Resource.Change
+  @spec init(opts :: keyword()) :: {:ok, keyword()}
   def init(opts) do
     {:ok, opts}
   end
 
-  @impl true
+  @impl Ash.Resource.Change
+  @spec change(changeset :: Ash.Changeset.t(), opts :: keyword(), context :: map()) ::
+          Ash.Changeset.t()
   def change(changeset, opts, context) do
     attachment_name = opts[:attachment_name]
     context_opts = Ash.Context.to_opts(context)
 
     changeset
+    |> Ash.Changeset.put_context(:__ash_storage_upload_plan__, nil)
+    |> Ash.Changeset.before_transaction(&prepare_upload_plan(&1, attachment_name))
+    |> Ash.Changeset.after_transaction(&finish_upload/2)
     |> Ash.Changeset.before_action(fn changeset ->
       record = changeset.data
       resource = record.__struct__
@@ -82,29 +89,108 @@ defmodule AshStorage.Changes.Attach do
     metadata = Ash.Changeset.get_argument(changeset, :metadata) || %{}
 
     with {:ok, attachment_def} <- Info.attachment(resource, attachment_name),
-         {:ok, {service_mod, service_opts}} <- resolve_service(resource, attachment_def) do
-      ctx = build_context(service_opts, resource, attachment_def, changeset)
-      key = AshStorage.resolve_key(attachment_def, ctx, changeset)
+         {:ok, {service_mod, ctx, key, transaction_cleanup?}} <-
+           upload_target(resource, attachment_def, changeset),
+         context_opts =
+           if(transaction_cleanup?,
+             do: Keyword.put(context_opts, :rollback_on_error?, false),
+             else: context_opts
+           ),
+         {:ok, blob, upload_ctx} <-
+           upload_and_create_blob(resource, service_mod, ctx, io, context_opts,
+             key: key,
+             filename: filename,
+             content_type: content_type,
+             metadata: metadata
+           ),
+         {:ok, blob, attrs_to_write} <-
+           run_analyzers(blob, attachment_def, record, io, context_opts) do
+      {:ok, attrs_to_write,
+       %{
+         blob: blob,
+         attachment_def: attachment_def,
+         service_mod: service_mod,
+         ctx: upload_ctx,
+         context_opts: context_opts,
+         has_oban_analyzers?: has_oban_analyzers?(attachment_def)
+       }}
+    end
+  end
 
-      with {:ok, blob} <-
-             upload_and_create_blob(resource, service_mod, ctx, io, context_opts,
-               key: key,
-               filename: filename,
-               content_type: content_type,
-               metadata: metadata
-             ),
-           {:ok, blob, attrs_to_write} <-
-             run_analyzers(blob, attachment_def, record, io, context_opts) do
-        {:ok, attrs_to_write,
-         %{
-           blob: blob,
-           attachment_def: attachment_def,
-           service_mod: service_mod,
-           ctx: ctx,
-           context_opts: context_opts,
-           has_oban_analyzers?: has_oban_analyzers?(attachment_def)
-         }}
-      end
+  @spec prepare_upload_plan(changeset :: Ash.Changeset.t(), attachment_name :: atom()) ::
+          Ash.Changeset.t()
+  defp prepare_upload_plan(changeset, attachment_name) do
+    with {:ok, %{path: path} = definition} when path in [nil, ""] <-
+           Info.attachment(changeset.resource, attachment_name),
+         {:ok, {service, options}} <- resolve_service(changeset.resource, definition) do
+      context = build_context(options, changeset.resource, definition, changeset)
+      key = AshStorage.resolve_key(definition, context, changeset)
+
+      Ash.Changeset.put_context(changeset, :__ash_storage_upload_plan__, %{
+        service: service,
+        context: context,
+        key: key
+      })
+    else
+      _custom_or_unavailable -> changeset
+    end
+  end
+
+  @spec upload_target(
+          resource :: module(),
+          definition :: struct(),
+          changeset :: Ash.Changeset.t()
+        ) ::
+          {:ok, {module(), Context.t(), String.t(), boolean()}} | {:error, term()}
+  defp upload_target(resource, definition, changeset) do
+    case changeset.context[:__ash_storage_upload_plan__] do
+      %{service: service, context: context, key: key} ->
+        {:ok, {service, context, key, true}}
+
+      nil ->
+        with {:ok, {service, options}} <- resolve_service(resource, definition) do
+          context = build_context(options, resource, definition, changeset)
+          {:ok, {service, context, AshStorage.resolve_key(definition, context, changeset), false}}
+        end
+    end
+  end
+
+  @spec finish_upload(changeset :: Ash.Changeset.t(), result :: {:ok, term()} | {:error, term()}) ::
+          {:ok, term()} | {:error, term()}
+  defp finish_upload(changeset, {:error, error}) do
+    case changeset.context[:__ash_storage_upload_plan__] do
+      %{service: service, context: context, key: key} ->
+        cleanup_planned_upload(service, context, key, error)
+
+      nil ->
+        {:error, error}
+    end
+  end
+
+  defp finish_upload(_changeset, result), do: result
+
+  @spec cleanup_planned_upload(
+          service :: module(),
+          context :: Context.t(),
+          key :: String.t(),
+          error :: term()
+        ) ::
+          {:error, term()}
+  defp cleanup_planned_upload(service, context, key, error) do
+    case service.exists?(key, context) do
+      {:ok, false} ->
+        {:error, error}
+
+      {:ok, true} ->
+        cleanup_upload(service, context, key, error)
+
+      {:error, cleanup_error} ->
+        {:error,
+         UploadCleanupFailed.exception(
+           operation_error: error,
+           cleanup_error: cleanup_error,
+           phase: :exists
+         )}
     end
   end
 
@@ -297,7 +383,35 @@ defmodule AshStorage.Changes.Attach do
         }
         |> Map.merge(extra_blob_attrs)
 
-      Ash.create(blob_resource, blob_attrs, Keyword.merge(context_opts, action: :create))
+      case Ash.create(blob_resource, blob_attrs, Keyword.merge(context_opts, action: :create)) do
+        {:ok, blob} ->
+          {:ok, blob, ctx}
+
+        {:error, error} ->
+          {:error, error}
+      end
+    end
+  end
+
+  @spec cleanup_upload(
+          service :: module(),
+          context :: Context.t(),
+          key :: String.t(),
+          error :: term()
+        ) ::
+          {:error, term()}
+  defp cleanup_upload(service, context, key, error) do
+    case service.delete(key, context) do
+      :ok ->
+        {:error, error}
+
+      {:error, cleanup_error} ->
+        {:error,
+         UploadCleanupFailed.exception(
+           operation_error: error,
+           cleanup_error: cleanup_error,
+           phase: :delete
+         )}
     end
   end
 
